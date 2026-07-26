@@ -27,7 +27,7 @@ for batch in batches:
     cols = st.columns(min(len(batch["photos"]), 6) or 1)
     for i, photo in enumerate(batch["photos"]):
         with cols[i % len(cols)]:
-            st.image(photo["jpeg_path"], use_container_width=True)
+            st.image(photo["jpeg_path"], width="stretch")
 
     with st.expander("Reprocess from the original scan"):
         st.caption(
