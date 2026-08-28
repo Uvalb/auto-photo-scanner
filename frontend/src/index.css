@@ -1,0 +1,11 @@
+/* App.css owns all real layout/styling; this file just resets defaults
+   Vite's template left behind (a fixed-width, centered #root, demo
+   heading sizes, etc.) that fought our full-viewport layout. */
+
+body {
+  margin: 0;
+}
+
+#root {
+  height: 100%;
+}
