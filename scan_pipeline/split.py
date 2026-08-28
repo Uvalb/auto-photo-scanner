@@ -6,11 +6,18 @@ to correct skew, not figure out which way is "up" — that requires
 understanding image content, not just geometry).
 """
 
+import math
 from dataclasses import dataclass, asdict
 
 import cv2
 import numpy as np
 from pathlib import Path
+
+# Max dimension (px) for images/boxes served to the browser editor. Raw
+# scans are multi-thousand-pixel TIFFs a browser can't even decode; the
+# frontend always works in this downscaled space, and the backend converts
+# back to full resolution only at the final crop step.
+DISPLAY_MAX_DIM = 1400
 
 # Ignore contours smaller than this fraction of the full scan area (dust,
 # mat seams, noise) or larger than this fraction (the whole bed, if the
@@ -80,6 +87,36 @@ def _four_point_crop(image: np.ndarray, box: np.ndarray) -> np.ndarray:
     if width > 2 * m and height > 2 * m:
         warped = warped[m:height - m, m:width - m]
     return warped
+
+
+def _box_to_corners(box: dict) -> np.ndarray:
+    """Center-based {cx, cy, w, h, angle-degrees} -> 4 corner points.
+
+    `angle` is the rotation (degrees, clockwise in image coordinates where
+    y increases downward) of the box's own width axis relative to the
+    image's x-axis. This exact convention is what the frontend's Konva
+    Rect (x=cx, y=cy, offsetX=w/2, offsetY=h/2, rotation=angle) speaks
+    natively, so boxes round-trip through the browser without translation.
+    """
+    cx, cy, w, h, angle = box["cx"], box["cy"], box["w"], box["h"], box["angle"]
+    rad = math.radians(angle)
+    wx, wy = math.cos(rad) * w / 2, math.sin(rad) * w / 2
+    hx, hy = -math.sin(rad) * h / 2, math.cos(rad) * h / 2
+    return np.array([
+        [cx - wx - hx, cy - wy - hy],
+        [cx + wx - hx, cy + wy - hy],
+        [cx + wx + hx, cy + wy + hy],
+        [cx - wx + hx, cy - wy + hy],
+    ], dtype=np.float32)
+
+
+def _corners_to_box(corners: np.ndarray) -> dict:
+    tl, tr, br, bl = _order_corners(corners.astype(np.float32))
+    center = np.mean([tl, tr, br, bl], axis=0)
+    w = float((np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2)
+    h = float((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2)
+    angle = float(np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0])))
+    return {"cx": float(center[0]), "cy": float(center[1]), "w": w, "h": h, "angle": angle}
 
 
 def _background_reference(image: np.ndarray, lab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -213,6 +250,48 @@ def find_photo_contours(image: np.ndarray, method: str = "background") -> list[n
     return _contours_from_mask(mask, image.shape)
 
 
+def find_photo_boxes(image: np.ndarray, method: str = "background") -> list[dict]:
+    contours = find_photo_contours(image, method=method)
+    boxes = [_corners_to_box(cv2.boxPoints(cv2.minAreaRect(c))) for c in contours]
+    # Reading order: top-to-bottom, then left-to-right.
+    boxes.sort(key=lambda b: (b["cy"] // 200, b["cx"]))
+    return boxes
+
+
+def scaled_dims(width: int, height: int, max_dim: int = DISPLAY_MAX_DIM) -> tuple[int, int, float]:
+    scale = min(1.0, max_dim / max(width, height))
+    return int(width * scale), int(height * scale), scale
+
+
+def display_image_bytes(raw_scan_path: Path, max_dim: int = DISPLAY_MAX_DIM) -> bytes:
+    """JPEG bytes of the raw scan downscaled for browser display."""
+    image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read image at {raw_scan_path}")
+    dw, dh, _ = scaled_dims(image.shape[1], image.shape[0], max_dim)
+    resized = cv2.resize(image, (dw, dh))
+    ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise ValueError(f"Failed to encode preview for {raw_scan_path}")
+    return buf.tobytes()
+
+
+def find_display_boxes(raw_scan_path: Path, method: str = "background", max_dim: int = DISPLAY_MAX_DIM) -> tuple[list[dict], dict]:
+    """Detected boxes scaled into the same coordinate space as `display_image_bytes`."""
+    image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read image at {raw_scan_path}")
+    width, height = image.shape[1], image.shape[0]
+    dw, dh, scale = scaled_dims(width, height, max_dim)
+    boxes = find_photo_boxes(image, method=method)
+    display_boxes = [
+        {"cx": b["cx"] * scale, "cy": b["cy"] * scale, "w": b["w"] * scale, "h": b["h"] * scale, "angle": b["angle"]}
+        for b in boxes
+    ]
+    meta = {"width": width, "height": height, "display_width": dw, "display_height": dh, "scale": scale}
+    return display_boxes, meta
+
+
 def preview_detections(raw_scan_path: Path, method: str = "background", max_dim: int = 1200) -> np.ndarray:
     """Return a downscaled copy of the raw scan with detected boxes drawn on it."""
     image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
@@ -232,21 +311,12 @@ def preview_detections(raw_scan_path: Path, method: str = "background", max_dim:
     return annotated
 
 
-def split_scan(raw_scan_path: Path, output_dir: Path, method: str = "background") -> list[CroppedPhoto]:
-    image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f"Could not read image at {raw_scan_path}")
-
-    contours = find_photo_contours(image, method=method)
-    # Reading order: top-to-bottom, then left-to-right.
-    contours.sort(key=lambda c: (cv2.boundingRect(c)[1] // 200, cv2.boundingRect(c)[0]))
-
+def _crop_and_save(image: np.ndarray, boxes: list[dict], output_dir: Path) -> list[CroppedPhoto]:
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for i, contour in enumerate(contours, start=1):
-        rect = cv2.minAreaRect(contour)
-        box = cv2.boxPoints(rect)
-        cropped = _four_point_crop(image, box)
+    for i, box in enumerate(boxes, start=1):
+        corners = _box_to_corners(box)
+        cropped = _four_point_crop(image, corners)
 
         tiff_path = output_dir / f"photo_{i:02d}.tiff"
         jpeg_path = output_dir / f"photo_{i:02d}.jpg"
@@ -261,6 +331,27 @@ def split_scan(raw_scan_path: Path, output_dir: Path, method: str = "background"
             height=cropped.shape[0],
         ))
     return results
+
+
+def split_scan(raw_scan_path: Path, output_dir: Path, method: str = "background") -> list[CroppedPhoto]:
+    image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read image at {raw_scan_path}")
+    boxes = find_photo_boxes(image, method=method)
+    return _crop_and_save(image, boxes, output_dir)
+
+
+def crop_from_boxes(raw_scan_path: Path, output_dir: Path, boxes: list[dict], scale: float = 1.0) -> list[CroppedPhoto]:
+    """Crop explicit (e.g. manually edited) boxes, given in a `scale`d-down
+    coordinate space (1.0 = full resolution) relative to the raw scan."""
+    image = cv2.imread(str(raw_scan_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read image at {raw_scan_path}")
+    full_res_boxes = [
+        {"cx": b["cx"] / scale, "cy": b["cy"] / scale, "w": b["w"] / scale, "h": b["h"] / scale, "angle": b["angle"]}
+        for b in boxes
+    ]
+    return _crop_and_save(image, full_res_boxes, output_dir)
 
 
 def photo_to_dict(photo: CroppedPhoto) -> dict:
